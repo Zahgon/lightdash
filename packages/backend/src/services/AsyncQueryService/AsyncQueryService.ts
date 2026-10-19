@@ -1527,6 +1527,40 @@ export class AsyncQueryService extends ProjectService {
             queryHistory.createdAt,
             queryContext,
         );
+
+        await this.cancelMergeLegs(account, projectUuid, queryUuid);
+    }
+
+    /**
+     * Cancels the legs a merge ran that are still running, under the same
+     * account. A leg another running query also reads is left to finish.
+     */
+    private async cancelMergeLegs(
+        account: Account,
+        projectUuid: string,
+        queryUuid: string,
+    ): Promise<void> {
+        const spec = await this.queryHistoryModel.getDuckdbExecution(queryUuid);
+        if (!spec?.guard) return;
+        // The guard names exactly the legs the merge ran, not the results it references
+        const legUuids = Object.keys(spec.guard.legLabelByReferenceTable)
+            .map((tableName) => spec.references[tableName])
+            .filter((legUuid): legUuid is string => legUuid !== undefined);
+        const runningLegs =
+            await this.queryHistoryModel.findRunningQueriesReadOnlyBy(
+                legUuids,
+                projectUuid,
+                queryUuid,
+            );
+        await Promise.all(
+            runningLegs.map((legUuid) =>
+                this.cancelAsyncQuery({
+                    account,
+                    projectUuid,
+                    queryUuid: legUuid,
+                }),
+            ),
+        );
     }
 
     /**
@@ -12350,6 +12384,12 @@ export class AsyncQueryService extends ProjectService {
                     resolvedIdentityEnabled = enabled;
                 },
             });
+            // A query cancelled while it waited on its references never runs
+            if (
+                references.kind === 'queries' &&
+                (await this.isQueryCancelled(queryUuid))
+            )
+                return;
             if (bound.aiSignInCredentialUuid) {
                 await this.queryHistoryModel.recordAiSignInCredential(
                     queryUuid,
@@ -12530,6 +12570,8 @@ export class AsyncQueryService extends ProjectService {
                     warehouseClient.credentials.type,
             });
         } catch (e) {
+            // A cancelled row stays cancelled, whatever the run failed with
+            if (await this.isQueryCancelled(queryUuid)) return;
             // A refusal is the feature working, and whoever reports the
             // outcome must tell it from a failure by reading the row alone,
             // so the refusal lands with the error status in one write
@@ -12556,6 +12598,11 @@ export class AsyncQueryService extends ProjectService {
                 account,
             );
         }
+    }
+
+    private async isQueryCancelled(queryUuid: string): Promise<boolean> {
+        const query = await this.queryHistoryModel.getByQueryUuid(queryUuid);
+        return query?.status === QueryHistoryStatus.CANCELLED;
     }
 
     /** Lands a python query on another run's results over the same files. */
@@ -13629,6 +13676,7 @@ export class AsyncQueryService extends ProjectService {
                     }),
                 );
                 return;
+            case 'cancelled':
             case 'error':
                 this.analytics.trackAccount(
                     account,
@@ -13636,7 +13684,7 @@ export class AsyncQueryService extends ProjectService {
                         submission,
                         queryId: queryUuid,
                         engine: 'compose',
-                        status: 'error',
+                        status: outcome.kind,
                         cacheHit: false,
                         legCacheHits,
                         rowCount: null,
