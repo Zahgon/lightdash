@@ -7,7 +7,8 @@ import { useMutation } from '@tanstack/react-query';
 import { useCallback, useRef } from 'react';
 import { lightdashApi } from '../../../api';
 
-const GENERATION_TIMEOUT_MS = 20000;
+// The server may look up several tables before answering
+const GENERATION_TIMEOUT_MS = 45000;
 
 const generateSqlRunnerQueryApi = async (
     projectUuid: string,
